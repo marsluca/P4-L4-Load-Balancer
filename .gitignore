@@ -1,1 +1,8 @@
-solution
+# Files
+*.txt
+*.json
+*.p4i
+
+# Directories
+pcap/
+log/
