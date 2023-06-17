@@ -11,6 +11,9 @@
 #define BACKEND3_IDX 4
 #define BACKEND4_IDX 5
 
+#define BACKEND_REGISTER_ENTRIES 65535
+#define BACKEND_SERVERS 4
+
 const bit<16> TYPE_IPV4 = 0x800;
 const bit<8>  TYPE_TCP  = 6;
 const bit<8>  TYPE_UDP  = 17;
@@ -18,11 +21,42 @@ const bit<8>  TYPE_UDP  = 17;
 *********************** H E A D E R S  ***********************************
 *************************************************************************/
 
-/* TODO 1: Define ethernet header */
+/* Ethernet header definition*/
+header ethernet_t {
+    bit<48> dstAddr;
+    bit<48> srcAddr;
+    bit<16> etherType;
+}
 
-/* TODO 2: Define IPv4 header */
+/* IPv4 header definition */
+header ipv4_t {
+    bit<4>  ihl;
+    bit<4>  version;
+    bit<8>  diffserv;
+    bit<16> totalLen;
+    bit<16> identification;
+    bit<3>  flags;
+    bit<13> fragOffset;
+    bit<8>  ttl;
+    bit<8>  protocol;
+    bit<16> hdrChecksum;
+    bit<32> srcAddr;
+    bit<32> dstAddr;
+}
 
-/* TODO 3: Define TCP header */
+/* TCP header definition */
+header tcp_t {
+    bit<16> srcPort;
+    bit<16> dstPort;
+    bit<32> seqNo;
+    bit<32> ackNo;
+    bit<4>  dataOffset;
+    bit<4>  res;
+    bit<8>  flags;
+    bit<16> window;
+    bit<16> checksum;
+    bit<16> urgentPtr;
+}
 
 /* Metadata structure is used to pass information
  * across the actions, or the control block.
@@ -38,8 +72,11 @@ struct metadata {
     /* TODO: Add here other metadata */
 }
 
+
 struct headers {
-    /* TODO 4: Define here the headers structure */
+    ethernet_t eth;
+    ipv4_t     ipv4;
+    tcp_t      tcp;
 }
 
 /*************************************************************************
@@ -54,10 +91,16 @@ parser MyParser(packet_in packet,
         transition parse_ethernet;
     }
 
+    /* Parsing the Ethernet header */
     state parse_ethernet {
-        /* TODO 5: Parse Ethernet Header */
+        packet.extract(hdr.eth);
+        transition select(hdr.eth.etherType) {
+            TYPE_IPV4: parse_ipv4;
+            default: accept;
+        }
     }
 
+    /* Parsing the IPv4 header */
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
         /* This information is used to recalculate the checksum 
@@ -67,11 +110,16 @@ parser MyParser(packet_in packet,
          */
         meta.l4_payload_length = hdr.ipv4.totalLen - (((bit<16>)hdr.ipv4.ihl) << 2);
 
-        /* TODO 6: Define here the transition to the parse_tcp state */
+        transition select(hdr.ipv4.protocol) {
+            TYPE_TCP: parse_tcp;
+            default: accept;
+        }
     }
 
+    /* Parsing the TCP header */
     state parse_tcp {
-        /* TODO 7: Parse TCP header */
+        packet.extract(hdr.tcp);
+        transition accept;
     }
 }
 
@@ -91,13 +139,12 @@ control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
 control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
-    /* TODO 11: Define here the register where you keep information about
-     * the backend assigned to a connection.
-     */
 
-    /* TODO 13: Define here the register where you keep information about
-     * the number of connections assigned to a backend
-     */
+    // Register to keep information about the backend assigned to a connection
+    register<bit<9>>(BACKEND_REGISTER_ENTRIES) r_assigned_backend;
+
+    // Register to keep information about the number of connections assigned to a backend
+    register<bit<32>>(BACKEND_SERVERS) r_connections_count;
 
     /* Drop action */
     action drop() {
@@ -118,6 +165,95 @@ control MyIngress(inout headers hdr,
     }
 
     /* Define here all the other actions that you might need */
+
+    //Check in r_connections_count the entry with the lowest number of connections between indexes 0 and 3 without using for loop or while loop
+    action min_r_connections_count(out bit<32> min, out bit<9> index) {
+        bit<32> min;
+        bit<32> tmp;
+        bit<9> index = 0;
+        r_connections_count.read(min, index);
+
+        r_connections_count.read(tmp, 1);
+        log_msg("\t\t> Checking backend {}, {} connections.", {1+(bit<9>)2, tmp});
+        if (tmp < min) {
+            min = tmp;
+            index = 1;
+        }
+        log_msg("\t\t> Checking backend {}, {} connections.", {2+(bit<9>)2, tmp});
+        r_connections_count.read(tmp, 2);
+        if (tmp < min) {
+            min = tmp;
+            index = 2;
+        }
+        log_msg("\t\t> Checking backend {}, {} connections.", {3+(bit<9>)2, tmp});
+        r_connections_count.read(tmp, 3);
+        if (tmp < min) {
+            min = tmp;
+            index = 3;
+        }        
+    }
+
+    /* Check if the current connection is already assigned to a specific 
+    * backend server. 
+    * If yes, forward the packet to the assigned backend (but first check the FIN or RST flag).
+    * If not, assign a new backend to the connection (only is the packet has the SYN flag set)
+    * otherwise, drop the packet.
+    */
+    action check_backend_assignment() {
+        bit<32> assigned_backend_index;
+        hash(assigned_backend_index, HashAlgorithm.crc32, (bit<16>)0, {hdr.ipv4.srcAddr,
+                                                    hdr.ipv4.dstAddr,
+                                                    srcPort,
+                                                    dstPort,
+                                                    hdr.ipv4.protocol},
+                                                    (bit<32>)BACKEND_REGISTER_ENTRIES);
+
+        bit<32> connections_count;
+        r_assigned_backend.read(meta.assigned_backend, assigned_backend_index);
+
+        // If connection is assigned to a backend
+        if (meta.assigned_backend != 0) {   
+            r_connections_count.read(connections_count, meta.assigned_backend);
+            log_msg("[MAPPED CONNECTION] There are {} connections assigned to backend {}", {connections_count, meta.assigned_backend});
+
+            if (hdr.tcp.flags == TCP_FLAG_FIN || hdr.tcp.flags == TCP_FLAG_RST) {
+                r_assigned_backend.write(assigned_backend_index, 0);
+                // Subtract 2 because beckend servers starts from 2 and register indexes from 0
+                r_connections_count.write(meta.assigned_backend - (bit<9>)2, connections_count-1);
+                log_msg("\t\t> FIN or RST flag set, backed assignment removed!");
+            }
+            forward(meta.assigned_backend);
+            log_msg("\t\t> Forwarding packet to backend {}...", {meta.assigned_backend});
+        // If connection is NOT assigned to a backend
+        } else {
+            log_msg("[NEW CONNECTION] Checking SYN flag...");
+            // If SYN flag is 1 and ACK flag is 0 assign a backend with least connections
+            if (hdr.tcp.flags == TCP_FLAG_SYN) {
+                log_msg("\t\t> SYN flag setted to 1 checking the ACK flag...");
+                if (hdr.tcp.flags != TCP_FLAG_ACK) {
+                    log_msg("\t\t> ACK flag setted to 0, assigning a backend...");
+
+                    // Find the index of the backend server with the least connections
+                    bit<9> min_r_connections_index;
+                    min_r_connections_count(connections_count, min_r_connections_index);
+
+                    // Backed server ID = register index + 2
+                    meta.assigned_backend = min_r_connections_index + (bit<9>)2;
+
+                    // Increment the number of connections for the assigned backend
+                    r_connections_count.read(connections_count, min_r_connections_index); 
+                    r_connections_count.write(min_r_connections_index, connections_count+1);
+                    log_msg("\t\t> Backend {} assigned, {} connections.", {meta.assigned_backend, connections_count});
+                } else {
+                    log_msg("\t\t> ACK flag setted to 1, PACKET DROPPED!");
+                    drop();
+                }
+            } else {
+                log_msg("\t\t> SYN flag setted to 0, PACKET DROPPED!");
+                drop();
+            }
+        }
+    }
 
     /* This action is executed to check if the current packet is 
      * destined to a virtual IP configured on the load balancer.
@@ -178,19 +314,29 @@ control MyIngress(inout headers hdr,
     }
 
     apply {  
-        /* TODO 8: Check if the ingress port is the one connected to the client. */
-
-        /* TODO 9: Verify whether the packet is destined for the Virtual IP 
+        /* Check if the ingress port is the one connected to the client. 
+         *
+         * Verify whether the packet is destined for the Virtual IP 
          * If not, drop the packet.
          * If yes, continue with the ingress logic
          */
+        if (hdr.eth.isValid() && hdr.ipv4.isValid() && hdr.tcp.isValid()) {
+            if (standard_metadata.ingress_port == CLIENT_PORT_IDX) {
+                if (virtual_ip.apply().action_run == is_virtual_ip) {
+                    check_backend_assignment();
+                }
+            }
+        } else if (standard_metadata.ingress_port == BACKEND1_PORT_IDX || 
+                standard_metadata.ingress_port == BACKEND2_PORT_IDX || 
+                standard_metadata.ingress_port == BACKEND3_PORT_IDX ||
+                standard_metadata.ingress_port == BACKEND4_PORT_IDX) {
+            //todo
+        }
+    }
 
-        /* TODO 10: Check if the current connection is already assigned to a specific 
-         * backend server. 
-         * If yes, forward the packet to the assigned backend (but first check the FIN or RST flag).
-         * If not, assign a new backend to the connection (only is the packet has the SYN flag set)
-         * otherwise, drop the packet.
-         */
+        
+
+        
 
         /* TODO 12: Define the logic to assign a new backend to the connection.
          * You should assign the backend with the minimum number of connections.
@@ -212,7 +358,6 @@ control MyIngress(inout headers hdr,
          * to the client. The backend_to_vip table is used to get the information
          * about the VIP.
          */
-    }
 }
 
 /*************************************************************************
