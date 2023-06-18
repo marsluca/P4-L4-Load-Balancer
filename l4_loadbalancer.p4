@@ -181,10 +181,11 @@ control MyIngress(inout headers hdr,
      * and update the relative fields. (IP, MAC and TCP port).
      */
     action update_backend_info(bit<32> ip, bit<16> port, bit<48> dstMac) {
-        log_msg("\t\t > Destination IP {}, port {}, MAC {}", {ip, port, dstMac});
         hdr.eth.dstAddr = dstMac;
         hdr.ipv4.dstAddr = ip;
         hdr.tcp.dstPort = port;
+        //decrease ttl by 1
+        hdr.ipv4.ttl = hdr.ipv4.ttl - 1;    
     }
 
     /* Define here all the other actions that you might need */
@@ -199,80 +200,26 @@ control MyIngress(inout headers hdr,
         index = 0;
 
         r_connections_count.read(min, index);
-        log_msg("\t\t> Checking backend {}, {} connections.", {(bit<9>)BACKEND1_IDX, min});
+        log_msg(">>> Checking backend {}, {} connections.", {(bit<9>)BACKEND1_IDX, min});
 
         r_connections_count.read(tmp, 1);
-        log_msg("\t\t> Checking backend {}, {} connections.", {(bit<9>)BACKEND2_IDX, tmp});
+        log_msg(">>> Checking backend {}, {} connections.", {(bit<9>)BACKEND2_IDX, tmp});
         if (tmp < min) {
             min = tmp;
             index = 1;
         }
-        log_msg("\t\t> Checking backend {}, {} connections.", {(bit<9>)BACKEND3_IDX, tmp});
+        log_msg(">>> Checking backend {}, {} connections.", {(bit<9>)BACKEND3_IDX, tmp});
         r_connections_count.read(tmp, 2);
         if (tmp < min) {
             min = tmp;
             index = 2;
         }
-        log_msg("\t\t> Checking backend {}, {} connections.", {(bit<9>)BACKEND4_IDX, tmp});
+        log_msg(">>> Checking backend {}, {} connections.", {(bit<9>)BACKEND4_IDX, tmp});
         r_connections_count.read(tmp, 3);
         if (tmp < min) {
             min = tmp;
             index = 3;
         }        
-    }
-
-    /* If the packet is already assigned, and if the FIN or RST flags are enabled 
-     * it removes the assignment and decrement the number of connections
-     * for the backend. Finally, forward the packet to the backend.
-     */
-    action mapped_connection() {
-        bit<32> connections_count;
-        // Subtract 2 because beckend servers starts from 2 and register indexes from 0
-        bit<32> r_connections_index = (bit<32>)meta.assigned_backend - 2;
-
-        r_connections_count.read(connections_count, r_connections_index);
-        log_msg("[MAPPED CONNECTION] There are {} connections assigned to backend {}", {connections_count, meta.assigned_backend});
-        // If FIN or RST flag is set, remove the backend assignment
-        if (hdr.tcp.fin == 1 || hdr.tcp.rst == 1) {
-            r_assigned_backend.write(meta.assigned_backend_hash, 0);
-            r_connections_count.write(r_connections_index, connections_count-1);
-            log_msg("\t\t> FIN or RST flag set, backed assignment removed!");
-        }
-        // log_msg("\t\t> Forwarding packet to backend {}...", {meta.assigned_backend});
-        // if (vip_to_backend.apply().action_run == update_backend_info) {
-        //     forward(meta.assigned_backend);
-        // }
-    }
-
-    action unmapped_connection() {
-        bit<32> connections_count;
-
-        log_msg("[NEW CONNECTION] Checking SYN flag...");
-        // If SYN flag is 1 and ACK flag is 0 assign a backend with least connections
-        if (hdr.tcp.syn == 1) {
-            log_msg("\t\t> SYN flag setted to 1 checking the ACK flag...");
-            if (hdr.tcp.ack == 1) {
-                log_msg("\t\t> ACK flag setted to 1, PACKET DROPPED!");
-                drop();
-                return;
-            } else {
-                log_msg("\t\t> ACK flag setted to 0, assigning a backend...");
-                // Find the index of the backend server with the least connections inside r_assigned_backend data structure
-                bit<32> r_connections_index;
-                min_r_connections_count(connections_count, r_connections_index);
-                // Backed server ID = register index + 2
-                meta.assigned_backend = (bit<9>)r_connections_index + (bit<9>)2;
-                // Increment the number of connections for the assigned backend
-                connections_count = connections_count + 1;
-                r_connections_count.write(r_connections_index, connections_count);
-                r_assigned_backend.write(meta.assigned_backend_hash, meta.assigned_backend);
-                log_msg("\t\t> Backend {} assigned, now {} connections.", {meta.assigned_backend, connections_count});
-            }
-        } else {
-            log_msg("\t\t> SYN flag setted to 0, PACKET DROPPED!");
-            drop();
-            return;
-        }
     }
 
     /* This action is executed to check if the current packet is 
@@ -289,10 +236,11 @@ control MyIngress(inout headers hdr,
      * This action is executed after a lookup on the backend_to_vip table.
      */
     action backend_to_vip_conversion(bit<32> srcIP, bit<16> port, bit<48> srcMac) {
-        log_msg("\t\t >Source IP {}, port {}, MAC {}", {srcIP, port, srcMac});
         hdr.ipv4.srcAddr = srcIP;
         hdr.tcp.srcPort = port; 
         hdr.eth.srcAddr = srcMac;
+        //decrease ttl by 1
+        hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
 
     /* Table used to understand if the current packet is destined 
@@ -345,6 +293,9 @@ control MyIngress(inout headers hdr,
             if (standard_metadata.ingress_port == CLIENT_PORT_IDX) {
                 switch (virtual_ip.apply().action_run) {
                     is_virtual_ip: {
+                        bit<32> connections_count;
+                        bit<32> r_connections_index;
+
                         /* Check if the current connection is already assigned to a specific 
                          * backend server. 
                          * If yes, forward the packet to the assigned backend (but first check the FIN or RST flag).
@@ -364,25 +315,65 @@ control MyIngress(inout headers hdr,
 
                         // If connection is assigned to a backend
                         if (meta.assigned_backend != 0) {   
-                            mapped_connection();
+                            /* If the packet is already assigned, and if the FIN or RST flags are enabled 
+                             * it removes the assignment and decrement the number of connections
+                             * for the backend. Finally, forward the packet to the backend.
+                             */
+                            
+                            // Subtract 2 because beckend servers starts from 2 and register indexes from 0
+                            r_connections_index = (bit<32>)meta.assigned_backend - 2;
+                    
+                            r_connections_count.read(connections_count, r_connections_index);
+                            log_msg("[MAPPED CONNECTION]>>> There are {} connections assigned to backend {}", {connections_count, meta.assigned_backend});
+                            // If FIN or RST flag is set, remove the backend assignment
+                            if (hdr.tcp.fin == 1 || hdr.tcp.rst == 1) {
+                                r_assigned_backend.write(meta.assigned_backend_hash, 0);
+                                r_connections_count.write(r_connections_index, connections_count-1);
+                                log_msg(">>> FIN or RST flag set, backed assignment removed!");
+                            }
+
                         // If connection is NOT assigned to a backend
                         } else {
-                            unmapped_connection();
+                            log_msg("[NEW CONNECTION]>>> Checking SYN flag...");
+                            // If SYN flag is 1 and ACK flag is 0 assign a backend with least connections
+                            if (hdr.tcp.syn == 1) {
+                                log_msg(">>> SYN flag setted to 1 checking the ACK flag...");
+                                if (hdr.tcp.ack == 1) {
+                                    log_msg(">>> ACK flag setted to 1, PACKET DROPPED!");
+                                    drop();
+                                    return;
+                                } else {
+                                    log_msg(">>> ACK flag setted to 0, assigning a backend...");
+                                    // Find the index of the backend server with the least connections inside r_assigned_backend data structure
+                                    min_r_connections_count(connections_count, r_connections_index);
+                                    // Backed server ID = register index + 2
+                                    meta.assigned_backend = (bit<9>)r_connections_index + (bit<9>)2;
+                                    // Increment the number of connections for the assigned backend
+                                    connections_count = connections_count + 1;
+                                    r_connections_count.write(r_connections_index, connections_count);
+                                    r_assigned_backend.write(meta.assigned_backend_hash, meta.assigned_backend);
+                                    log_msg(">>> Backend {} assigned, now {} connections.", {meta.assigned_backend, connections_count});
+                                }
+                            } else {
+                                log_msg(">>> SYN flag setted to 0, PACKET DROPPED!");
+                                drop();
+                                return;
+                            }
                         }
-                        log_msg("\t\t> Forwarding packet to backend {}...", {meta.assigned_backend});
+                        log_msg(">>> Forwarding packet to backend {}...", {meta.assigned_backend});
                         switch (vip_to_backend.apply().action_run) {
                             update_backend_info: {
                                 forward(meta.assigned_backend);
                             }
                             drop: {
-                                log_msg("[DROP] No matching backend found");
+                                log_msg("[DROP]>>> No matching backend found");
                                 return;
                             }
                         }
 
                     }
                     drop: {
-                        log_msg("[DROP] VIP received a packet not destined to a virtual IP");
+                        log_msg("[DROP]>>> VIP received a packet not destined to a virtual IP");
                         return;
                     }
                 }
@@ -397,7 +388,7 @@ control MyIngress(inout headers hdr,
                         forward(CLIENT_PORT_IDX);
                     }
                     drop: {
-                        log_msg("[DROP] Backend received a packet from a configured backed port but from an unknown IP.");
+                        log_msg("[DROP]>>> Backend received a packet from a configured backed port but from an unknown IP.");
                         return;
                     }
             }
@@ -477,6 +468,8 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
 
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
+        log_msg(">>> IPv4 checksum decimal {}", {hdr.ipv4.hdrChecksum});
+        log_msg(">>> TCP checksum decimal {}", {hdr.tcp.checksum});
         packet.emit(hdr.eth);
         packet.emit(hdr.ipv4);
         packet.emit(hdr.tcp);
