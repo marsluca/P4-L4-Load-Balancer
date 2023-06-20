@@ -30,15 +30,15 @@ header ethernet_t {
 
 /* IPv4 header definition */
 header ipv4_t {
-    bit<4>  ihl;
-    bit<4>  version;
-    bit<8>  diffserv;
+    bit<4> version;
+    bit<4> ihl;
+    bit<8> diffserv;
     bit<16> totalLen;
     bit<16> identification;
-    bit<3>  flags;
+    bit<3> flags;
     bit<13> fragOffset;
-    bit<8>  ttl;
-    bit<8>  protocol;
+    bit<8> ttl;
+    bit<8> protocol;
     bit<16> hdrChecksum;
     bit<32> srcAddr;
     bit<32> dstAddr;
@@ -79,7 +79,6 @@ struct metadata {
     /* TODO: Add here other metadata */
     bit<32> assigned_backend_hash;
 }
-
 
 struct headers {
     ethernet_t ethernet;
@@ -183,9 +182,7 @@ control MyIngress(inout headers hdr,
     action update_backend_info(bit<32> ip, bit<16> port, bit<48> dstMac) {
         hdr.ethernet.dstAddr = dstMac;
         hdr.ipv4.dstAddr = ip;
-        hdr.tcp.dstPort = port;
-        //decrease ttl by 1
-        //hdr.ipv4.ttl = hdr.ipv4.ttl - 1;    
+        hdr.tcp.dstPort = port;   
     }
 
     /* Define here all the other actions that you might need */
@@ -239,8 +236,6 @@ control MyIngress(inout headers hdr,
         hdr.ipv4.srcAddr = srcIP;
         hdr.tcp.srcPort = port; 
         hdr.ethernet.srcAddr = srcMac;
-        //decrease ttl by 1
-        //hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
 
     /* Table used to understand if the current packet is destined 
@@ -291,6 +286,7 @@ control MyIngress(inout headers hdr,
          */
         if (hdr.ethernet.isValid() && hdr.ipv4.isValid() && hdr.tcp.isValid()) {
             if (standard_metadata.ingress_port == CLIENT_PORT_IDX) {
+                log_msg(">>> Packet from CLIENT");
                 switch (virtual_ip.apply().action_run) {
                     is_virtual_ip: {
                         bit<32> connections_count;
@@ -370,20 +366,20 @@ control MyIngress(inout headers hdr,
                                 return;
                             }
                         }
-
                     }
                     drop: {
                         log_msg("[DROP]>>> VIP received a packet not destined to a virtual IP");
                         return;
                     }
                 }
-            }
-        } else if (standard_metadata.ingress_port == BACKEND1_IDX || 
+            } else if (standard_metadata.ingress_port == BACKEND1_IDX || 
                 standard_metadata.ingress_port == BACKEND2_IDX || 
                 standard_metadata.ingress_port == BACKEND3_IDX ||
                 standard_metadata.ingress_port == BACKEND4_IDX) {
-            // Forward to the client
-            switch (backend_to_vip.apply().action_run) {
+                
+                log_msg(">>> Packet from BACKEND");
+                // Forward to the client
+                switch (backend_to_vip.apply().action_run) {
                     backend_to_vip_conversion: {
                         forward(CLIENT_PORT_IDX);
                     }
@@ -391,7 +387,12 @@ control MyIngress(inout headers hdr,
                         log_msg("[DROP]>>> Backend received a packet from a configured backed port but from an unknown IP.");
                         return;
                     }
+                }
             }
+        } else {
+            drop();
+            log_msg("[DROP]>>> Packet dropped no valid header.");
+            return;
         }
     }
 }
@@ -468,41 +469,6 @@ control MyComputeChecksum(inout headers hdr, inout metadata meta) {
 
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
-        log_msg(">>> Ethernet srcAddr {}", {hdr.ethernet.srcAddr});
-        log_msg(">>> Ethernet dstAddr {}", {hdr.ethernet.dstAddr});
-        log_msg(">>> Ethernet etherType {}", {hdr.ethernet.etherType});
-        log_msg(">>> IPv4 version {}", {hdr.ipv4.version});
-        log_msg(">>> IPv4 ihl {}", {hdr.ipv4.ihl});
-        log_msg(">>> IPv4 diffserv {}", {hdr.ipv4.diffserv});
-        log_msg(">>> IPv4 totalLen {}", {hdr.ipv4.totalLen});
-        log_msg(">>> IPv4 identification {}", {hdr.ipv4.identification});
-        log_msg(">>> IPv4 flags {}", {hdr.ipv4.flags});
-        log_msg(">>> IPv4 fragOffset {}", {hdr.ipv4.fragOffset});
-        log_msg(">>> IPv4 ttl {}", {hdr.ipv4.ttl});
-        log_msg(">>> IPv4 protocol {}", {hdr.ipv4.protocol});
-        log_msg(">>> IPv4 hdrChecksum {}", {hdr.ipv4.hdrChecksum});
-        log_msg(">>> IPv4 srcAddr {}", {hdr.ipv4.srcAddr});
-        log_msg(">>> IPv4 dstAddr {}", {hdr.ipv4.dstAddr});
-        log_msg(">>> TCP srcPort {}", {hdr.tcp.srcPort});
-        log_msg(">>> TCP dstPort {}", {hdr.tcp.dstPort});
-        log_msg(">>> TCP seqNo {}", {hdr.tcp.seqNo});
-        log_msg(">>> TCP ackNo {}", {hdr.tcp.ackNo});
-        log_msg(">>> TCP dataOffset {}", {hdr.tcp.dataOffset});
-        log_msg(">>> TCP res {}", {hdr.tcp.res});
-        log_msg(">>> TCP cwr {}", {hdr.tcp.cwr});
-        log_msg(">>> TCP ece {}", {hdr.tcp.ece});
-        log_msg(">>> TCP urg {}", {hdr.tcp.urg});
-        log_msg(">>> TCP ack {}", {hdr.tcp.ack});
-        log_msg(">>> TCP psh {}", {hdr.tcp.psh});
-        log_msg(">>> TCP rst {}", {hdr.tcp.rst});
-        log_msg(">>> TCP syn {}", {hdr.tcp.syn});
-        log_msg(">>> TCP fin {}", {hdr.tcp.fin});
-        log_msg(">>> TCP window {}", {hdr.tcp.window});
-        log_msg(">>> TCP checksum {}", {hdr.tcp.checksum});
-        log_msg(">>> TCP urgentPtr {}", {hdr.tcp.urgentPtr});
-        //log_msg(">>> IPv4 checksum decimal {}", {hdr.ipv4.hdrChecksum});
-        //log_msg(">>> TCP checksum decimal {}", {hdr.tcp.checksum});
-
         packet.emit(hdr.ethernet);
         packet.emit(hdr.ipv4);
         packet.emit(hdr.tcp);
